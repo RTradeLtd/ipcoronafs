@@ -2,6 +2,10 @@
 
 `ipcoronafs` is a tool to scrape information from [coronavirus api tracker](https://github.com/ExpDev07/coronavirus-tracker-api) using [go-corona](https://github.com/itsksaurabh/go-corona) and storing it on IPFS through TemporalX. It expects a locally running TemporalX server, but can be be configured to use a remote one..
 
+# Overview
+
+For an overview of this see [medium](https://medium.com/temporal-cloud/real-time-covid-19-sars-cov-2-outbreak-stats-over-libp2p-ipfs-75972c9afa7)
+
 # Workflow
 
 * Every 60 minutes we use the go-corona client to fetch the "latest location data" and "all location data" sources.
