@@ -9,6 +9,8 @@ import (
 	"io"
 	"log"
 	"os"
+	"sync"
+	"time"
 
 	pb "github.com/RTradeLtd/TxPB/v3/go"
 	gocorona "github.com/itsksaurabh/go-corona"
@@ -20,6 +22,11 @@ import (
 var (
 	defaultURL = "127.0.0.1:9090"
 	insecure   = true
+)
+
+const (
+	allLocationDataTopic    = "coronavirus-all-location-data-topic"
+	latestLocationDataTopic = "coronavirus-latest-location-data-topic"
 )
 
 func newApp(ctx context.Context, cancel context.CancelFunc) *cli.App {
@@ -41,11 +48,201 @@ func newApp(ctx context.Context, cancel context.CancelFunc) *cli.App {
 	}
 	app.Commands = cli.Commands{
 		&cli.Command{
+			Name:  "service",
+			Usage: "run the temporalx ipcoronafs service",
+			Action: func(c *cli.Context) error {
+				allRebroadCaster := make(chan string, 1)
+				defer close(allRebroadCaster)
+				latestRebroadcaster := make(chan string, 1)
+				defer close(latestRebroadcaster)
+				defer cancel()
+				conn, err := getConn(ctx, c.String("endpoint"), c.Bool("insecure"))
+				defer conn.Close()
+				ps, err := getPubSubClient(ctx, conn)
+				if err != nil {
+					return err
+				}
+				pubsub, err := ps.PubSub(ctx)
+				if err != nil {
+					return err
+				}
+				defer pubsub.CloseSend()
+				fc, err := getFileClient(ctx, conn)
+				if err != nil {
+					return err
+				}
+				handleLatest := func() error {
+					// client for accessing different endpoints of the API
+					gorona := gocorona.Client{}
+					fmt.Println("getting all latest data")
+					locations, err := gorona.GetLatestData(ctx)
+					if err != nil {
+						return err
+					}
+					data, err := json.Marshal(locations)
+					if err != nil {
+						return err
+					}
+					fmt.Println("adding latest data to ipfs")
+					hash, err := uploadFile(fc, bytes.NewReader(data))
+					if err != nil {
+						return err
+					}
+					fmt.Println("latest data hash: ", hash)
+					if err := pubsub.Send(&pb.PubSubRequest{
+						RequestType: pb.PSREQTYPE_PS_PUBLISH,
+						Topics:      []string{latestLocationDataTopic},
+						Data:        []byte(hash),
+					}); err != nil {
+						log.Println("ERROR: failed to send latest data via pubsub")
+					}
+					latestRebroadcaster <- hash
+					fmt.Println("sent pubsub data")
+					return nil
+				}
+				handleAll := func() error {
+					// client for accessing different endpoints of the API
+					gorona := gocorona.Client{}
+					fmt.Println("getting all location data")
+					locations, err := gorona.GetAllLocationData(ctx, c.Bool("with.timelines"))
+					if err != nil {
+						return err
+					}
+					data, err := json.Marshal(locations)
+					if err != nil {
+						return err
+					}
+					fmt.Println("adding location data to ipfs")
+					hash, err := uploadFile(fc, bytes.NewReader(data))
+					if err != nil {
+						return err
+					}
+					fmt.Println("all location data hash: ", hash)
+					if err := pubsub.Send(&pb.PubSubRequest{
+						RequestType: pb.PSREQTYPE_PS_PUBLISH,
+						Topics:      []string{allLocationDataTopic},
+						Data:        []byte(hash),
+					}); err != nil {
+						log.Println("ERROR: failed to send latest data via pubsub")
+					}
+					allRebroadCaster <- hash
+					return nil
+				}
+				allTicker := time.NewTicker(time.Hour)
+				defer allTicker.Stop()
+				latestTicker := time.NewTicker(time.Hour)
+				defer latestTicker.Stop()
+				// run a latest fetch
+				if err := handleLatest(); err != nil {
+					log.Println("ERROR: failed to get latest: ", err)
+				}
+				// run an all fetch
+				if err := handleAll(); err != nil {
+					log.Println("ERROR: failed to get all: ", err)
+				}
+				rebroadcaster := time.NewTicker(time.Minute)
+				defer rebroadcaster.Stop()
+				var (
+					lastCancel   context.CancelFunc
+					lastContext  context.Context
+					lastCancel2  context.CancelFunc
+					lastContext2 context.Context
+					lock         sync.Mutex
+				)
+				for {
+					select {
+					case <-ctx.Done():
+						return nil
+					case <-allTicker.C:
+						go func() {
+							if err := handleAll(); err != nil {
+								log.Println("ERROR: failed to get all: ", err)
+							}
+						}()
+					case <-latestTicker.C:
+						go func() {
+							if err := handleLatest(); err != nil {
+								log.Println("ERROR: failed to get latest: ", err)
+							}
+						}()
+					case hash := <-allRebroadCaster:
+						fmt.Println("handling all rebroadcast")
+						lock.Lock()
+						if lastCancel != nil {
+							lastCancel()
+						}
+						lastContext, lastCancel = context.WithCancel(ctx)
+						lock.Unlock()
+						go func() {
+							ticker := time.NewTicker(time.Minute)
+							defer ticker.Stop()
+							for {
+								select {
+								case <-lastContext.Done():
+									return
+								case <-ticker.C:
+									fmt.Println("sending rebroadcast")
+									if err := pubsub.Send(&pb.PubSubRequest{
+										RequestType: pb.PSREQTYPE_PS_PUBLISH,
+										Topics:      []string{allLocationDataTopic},
+										Data:        []byte(hash),
+									}); err != nil {
+										log.Println("ERROR: failed to send latest data via pubsub")
+									}
+								}
+							}
+						}()
+						fmt.Println("sending all location data hash through pubsub")
+
+					case hash := <-latestRebroadcaster:
+						fmt.Println("handling latest rebroadcaster")
+						lock.Lock()
+						if lastCancel2 != nil {
+							lastCancel2()
+						}
+						lastContext2, lastCancel2 = context.WithCancel(ctx)
+						lock.Unlock()
+						go func() {
+							ticker := time.NewTicker(time.Minute)
+							defer ticker.Stop()
+							for {
+								select {
+								case <-lastContext2.Done():
+									return
+								case <-ticker.C:
+									fmt.Println("sending rebroadcast")
+									if err := pubsub.Send(&pb.PubSubRequest{
+										RequestType: pb.PSREQTYPE_PS_PUBLISH,
+										Topics:      []string{allLocationDataTopic},
+										Data:        []byte(hash),
+									}); err != nil {
+										log.Println("ERROR: failed to send latest data via pubsub")
+									}
+								}
+							}
+						}()
+						fmt.Println("sending all location data hash through pubsub")
+
+					}
+
+				}
+			},
+			Flags: []cli.Flag{
+				&cli.BoolFlag{
+					Name:  "with.timelines",
+					Usage: "enable timeline scraping",
+					Value: false,
+				},
+			},
+		},
+		&cli.Command{
 			Name:  "scrape-all-location",
 			Usage: "scrapes all location data",
 			Action: func(c *cli.Context) error {
 				defer cancel()
-				tc, err := getFileClient(ctx, c.String("endpoint"), c.Bool("insecure"))
+				conn, err := getConn(ctx, c.String("endpoint"), c.Bool("insecure"))
+				defer conn.Close()
+				tc, err := getFileClient(ctx, conn)
 				if err != nil {
 					return err
 				}
@@ -79,7 +276,9 @@ func newApp(ctx context.Context, cancel context.CancelFunc) *cli.App {
 			Usage: "scrapes latest set of data",
 			Action: func(c *cli.Context) error {
 				defer cancel()
-				tc, err := getFileClient(ctx, c.String("endpoint"), c.Bool("insecure"))
+				conn, err := getConn(ctx, c.String("endpoint"), c.Bool("insecure"))
+				defer conn.Close()
+				tc, err := getFileClient(ctx, conn)
 				if err != nil {
 					return err
 				}
@@ -113,7 +312,9 @@ func newApp(ctx context.Context, cancel context.CancelFunc) *cli.App {
 			Usage: "scrapes latest set of data",
 			Action: func(c *cli.Context) error {
 				defer cancel()
-				tc, err := getFileClient(ctx, c.String("endpoint"), c.Bool("insecure"))
+				conn, err := getConn(ctx, c.String("endpoint"), c.Bool("insecure"))
+				defer conn.Close()
+				tc, err := getFileClient(ctx, conn)
 				if err != nil {
 					return err
 				}
@@ -151,7 +352,9 @@ func newApp(ctx context.Context, cancel context.CancelFunc) *cli.App {
 			Usage: "scrapes latest set of data going by country code",
 			Action: func(c *cli.Context) error {
 				defer cancel()
-				tc, err := getFileClient(ctx, c.String("endpoint"), c.Bool("insecure"))
+				conn, err := getConn(ctx, c.String("endpoint"), c.Bool("insecure"))
+				defer conn.Close()
+				tc, err := getFileClient(ctx, conn)
 				if err != nil {
 					return err
 				}
@@ -188,20 +391,18 @@ func newApp(ctx context.Context, cancel context.CancelFunc) *cli.App {
 	return app
 }
 
-func getFileClient(ctx context.Context, endpoint string, insecure bool) (pb.FileAPIClient, error) {
-	var (
-		conn *grpc.ClientConn
-		err  error
-	)
+func getConn(ctx context.Context, endpoint string, insecure bool) (*grpc.ClientConn, error) {
 	if insecure {
-		conn, err = grpc.DialContext(ctx, defaultURL, grpc.WithInsecure())
-	} else {
-		conn, err = grpc.DialContext(ctx, defaultURL, grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{InsecureSkipVerify: true})))
+		return grpc.DialContext(ctx, defaultURL, grpc.WithInsecure())
 	}
-	if err != nil {
-		return nil, err
-	}
+	return grpc.DialContext(ctx, defaultURL, grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{InsecureSkipVerify: true})))
+}
+
+func getFileClient(ctx context.Context, conn *grpc.ClientConn) (pb.FileAPIClient, error) {
 	return pb.NewFileAPIClient(conn), nil
+}
+func getPubSubClient(ctx context.Context, conn *grpc.ClientConn) (pb.PubSubAPIClient, error) {
+	return pb.NewPubSubAPIClient(conn), nil
 }
 
 func main() {
