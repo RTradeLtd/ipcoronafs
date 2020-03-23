@@ -213,7 +213,7 @@ func newApp(ctx context.Context, cancel context.CancelFunc) *cli.App {
 									fmt.Println("sending rebroadcast")
 									if err := pubsub.Send(&pb.PubSubRequest{
 										RequestType: pb.PSREQTYPE_PS_PUBLISH,
-										Topics:      []string{allLocationDataTopic},
+										Topics:      []string{latestLocationDataTopic},
 										Data:        []byte(hash),
 									}); err != nil {
 										log.Println("ERROR: failed to send latest data via pubsub")
